@@ -1,93 +1,84 @@
 import time
 import torch, triton
-import triton.language as tl
+
+from torch.autograd import Function
+
+from softmax_bw_triton import softmax_bw_triton
+from softmax_fw_triton import softmax_fw_triton
 
 
-def softmax_ref(x: torch.Tensor) -> torch.Tensor:
-    # x: [M, N]
-    x_max = x.max(dim=1, keepdim=True).values
-    x_exp = (x - x_max).exp()
-    return x_exp / x_exp.sum(dim=1, keepdim=True)
+class SoftmaxTriton(Function):
+    @staticmethod
+    def forward(ctx, x):
+        y = softmax_fw_triton(x)
+        ctx.save_for_backward(y)
+        return y
 
-
-@triton.jit
-def softmax_kernel(
-        x_ptr, y_ptr,
-        M, N,
-        stride_xm, stride_xn,
-        stride_ym, stride_yn,
-        BLOCK_N: tl.constexpr
-):
-    m = tl.program_id(0)
-    offs = tl.arange(0, BLOCK_N)
-    row_x = x_ptr + m * stride_xm
-    row_y = y_ptr + m * stride_ym
-
-    row_max = float("-inf")
-    for n in range(0, N, BLOCK_N):
-        idx = n + offs
-        mask = idx < N
-        x = tl.load(row_x + idx * stride_xn, mask=mask, other=float("-inf"))
-        row_max = tl.maximum(row_max, tl.max(x, axis=0))
-
-    row_sum = 0.0
-    for n in range(0, N, BLOCK_N):
-        idx = n + offs
-        mask = idx < N
-        x = tl.load(row_x + idx * stride_xn, mask=mask, other=float("-inf"))
-        ex = tl.exp(x - row_max)
-        row_sum += tl.sum(ex, axis=0)
-
-    for n in range(0, N, BLOCK_N):
-        idx = n + offs
-        mask = idx < N
-        x = tl.load(row_x + idx * stride_xn, mask=mask, other=float("-inf"))
-        ex = tl.exp(x - row_max)
-        y = ex / row_sum
-        tl.store(row_y + idx * stride_yn, y, mask=mask)
-
-
-def softmax_triton(x: torch.Tensor, BLOCK_N=1024) -> torch.Tensor:
-    M, N = x.shape
-    y = torch.empty_like(x)
-    grid = lambda meta: (M,)
-    softmax_kernel[grid](
-        x, y,
-        M, N,
-        x.stride(0), x.stride(1),
-        y.stride(0), y.stride(1),
-        BLOCK_N=BLOCK_N
-    )
-    return y
+    @staticmethod
+    def backward(ctx, grad_out):
+        (y,) = ctx.saved_tensors
+        dx = softmax_bw_triton(y, grad_out)
+        return dx
 
 
 def softmax_test():
     torch.manual_seed(0)
-    M, N = 4, 16
-    x = torch.randn(M, N, device="cuda", dtype=torch.float32)
-    y_ref = softmax_ref(x)
-    y_tri = softmax_triton(x)
-    max_abs = (y_ref - y_tri).abs().max().item()
-    print("max |Δ|:", max_abs)
+    M, N = 1024, 4096
+
+    x0 = torch.randn(M, N, device="cuda", dtype=torch.float32)
+    x1 = x0.clone().requires_grad_(True)
+    x2 = x0.clone().requires_grad_(True)
+
+    y_triton = SoftmaxTriton.apply(x1)
+    y_ref = torch.softmax(x2, dim=-1)
+
+    f_err = (y_ref - y_triton).abs().max().item()
+    print("forward max |Δ|:", f_err)
+
+    y_triton.sum().backward()
+    y_ref.sum().backward()
+
+    b_err = (x1.grad - x2.grad).abs().max().item()
+    print("backward max |Δ|:", b_err)
 
 
-def bench(fn, x, iter=200, warmup=50):
+def bench(fn, iters=200, warmup=50):
     for _ in range(warmup):
-        fn(x); torch.cuda.synchronize()
+        fn(); torch.cuda.synchronize()
     t0 = time.perf_counter()
-    for _ in range(iter):
-        fn(x)
+    for _ in range(iters):
+        fn()
     torch.cuda.synchronize()
     t1 = time.perf_counter()
-    return (t1 - t0) / iter * 1e3
+    return (t1 - t0) / iters * 1e3
+
+
+def e2e_ref(x0):
+    def run():
+        x = x0.clone().requires_grad_(True)
+        y = torch.softmax(x, dim=-1)
+        y.sum().backward()
+    return run
+
+
+def e2e_triton(x0):
+    def run():
+        x = x0.clone().requires_grad_(True)
+        y = SoftmaxTriton.apply(x)
+        y.sum().backward()
+    return run
 
 
 if __name__ == "__main__":
-    M, N = 1024, 4096
-    x = torch.randn(M, N, device="cuda", dtype=torch.float32)
-    ms_torch = bench(lambda t: torch.nn.functional.softmax(t, dim=-1), x)
-    ms_tri = bench(lambda t: softmax_triton(t), x)
-    ms_cpu = bench(softmax_ref, x)
-    print(f"ms torch: {ms_torch:.3f} ms")
-    print(f"ms tri: {ms_tri:.3f} ms")
-    print(f"ms cpu: {ms_cpu:.3f} ms")
+    softmax_test()
+
+    torch.manual_seed(0)
+    shapes = [(256, 1024), (512, 2048), (1024, 4096), (2048, 4096)]
+    for M, N in shapes:
+        x0 = torch.randn(M, N, device="cuda", dtype=torch.float32)
+
+        ms_ref = bench(e2e_ref(x0))
+        ms_triton = bench(e2e_triton(x0))
+
+        print(f"[{M}x{N}] ref: {ms_ref:.3f} ms | triton: {ms_triton:.3f} ms")
+
